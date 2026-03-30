@@ -1,0 +1,3 @@
+dataset,mean_delta_TPR,mean_delta_FPR,improved_users_pct,n_users,source
+synthetic,-0.6,-0.01538461538461538,0.0,5,data/processed/personalization_results_smoke.csv
+real_ecg,-1.0,-1.0,0.0,8,data/processed/personalization_results_real_ecg_smoke.csv
