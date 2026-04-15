@@ -1,146 +1,56 @@
-"""Utilities to load and split the MIT-BIH heartbeat dataset for federated use."""
-
-from __future__ import annotations
-
 import numpy as np
 import pandas as pd
+import os
 from sklearn.model_selection import train_test_split
 
 
-def _format_distribution(name, y):
-    """Print class distribution and imbalance for a binary label vector."""
-    y = np.asarray(y).reshape(-1)
-    n_total = int(y.size)
-    n_normal = int((y == 0).sum())
-    n_anomaly = int((y == 1).sum())
-    anomaly_rate = (n_anomaly / n_total) if n_total > 0 else 0.0
-    imbalance_ratio = (n_normal / n_anomaly) if n_anomaly > 0 else float("inf")
-
-    print(
-        f"{name}: total={n_total}, normal={n_normal}, anomaly={n_anomaly}, "
-        f"anomaly_rate={anomaly_rate:.4f}, imbalance_ratio(normal/anomaly)={imbalance_ratio:.4f}"
-    )
-
-
-def _stratified_split_three_way(X, y, seed):
-    """Split arrays into train/val/test with stratification when possible."""
-    X = np.asarray(X)
-    y = np.asarray(y).reshape(-1)
-
-    if X.shape[0] == 0:
-        return X, y, X, y, X, y
-
-    def _can_stratify(labels):
-        unique, counts = np.unique(labels, return_counts=True)
-        return unique.size >= 2 and counts.min() >= 2
-
-    n_samples = X.shape[0]
-    if n_samples < 5:
-        # Tiny fallback split to avoid train_test_split edge-case failures.
-        i1 = max(1, int(0.6 * n_samples))
-        i2 = max(i1 + 1, int(0.8 * n_samples))
-        i2 = min(i2, n_samples)
-        return (
-            X[:i1],
-            y[:i1],
-            X[i1:i2],
-            y[i1:i2],
-            X[i2:],
-            y[i2:],
-        )
-
-    stratify_all = y if _can_stratify(y) else None
-    X_train, X_tmp, y_train, y_tmp = train_test_split(
-        X,
-        y,
-        test_size=0.4,
-        random_state=seed,
-        stratify=stratify_all,
-    )
-
-    stratify_tmp = y_tmp if _can_stratify(y_tmp) else None
-    X_val, X_test, y_val, y_test = train_test_split(
-        X_tmp,
-        y_tmp,
-        test_size=0.5,
-        random_state=seed,
-        stratify=stratify_tmp,
-    )
-
-    return X_train, y_train, X_val, y_val, X_test, y_test
-
-
 def load_mitbih(train_path, test_path):
-    """Load MIT-BIH train/test CSVs and return Conv1d-ready NumPy arrays.
+    if not os.path.exists(train_path):
+        raise FileNotFoundError(f"Missing train CSV: {train_path}")
+    if not os.path.exists(test_path):
+        raise FileNotFoundError(f"Missing test CSV: {test_path}")
 
-    Parameters
-    ----------
-    train_path : str
-        Path to mitbih_train.csv.
-    test_path : str
-        Path to mitbih_test.csv.
-
-    Returns
-    -------
-    tuple[numpy.ndarray, numpy.ndarray, numpy.ndarray, numpy.ndarray]
-        X_train, y_train, X_test, y_test where:
-        - X_* shape is (N, 1, 187)
-        - y_* shape is (N,)
-
-    Notes
-    -----
-    Label mapping:
-    - 0 -> 0 (normal)
-    - 1,2,3,4 -> 1 (anomaly)
-    """
     train_df = pd.read_csv(train_path, header=None)
     test_df = pd.read_csv(test_path, header=None)
 
-    X_train = train_df.iloc[:, :-1].to_numpy(dtype=np.float32)
-    y_train_raw = train_df.iloc[:, -1].to_numpy(dtype=np.int32)
-    X_test = test_df.iloc[:, :-1].to_numpy(dtype=np.float32)
-    y_test_raw = test_df.iloc[:, -1].to_numpy(dtype=np.int32)
+    train_label_col = train_df.columns[-1]
+    test_label_col = test_df.columns[-1]
+    train_df = train_df.rename(columns={train_label_col: "label"})
+    test_df = test_df.rename(columns={test_label_col: "label"})
 
-    y_train = (y_train_raw != 0).astype(np.int32)
-    y_test = (y_test_raw != 0).astype(np.int32)
+    train_df["label"] = (train_df["label"].astype(int) >= 1).astype(int)
+    test_df["label"] = (test_df["label"].astype(int) >= 1).astype(int)
 
-    # Conv1d input format: (N, C, L) with C=1 and L=187.
-    X_train = X_train.reshape(-1, 1, 187)
-    X_test = X_test.reshape(-1, 1, 187)
+    n_normal_tr = int((train_df["label"] == 0).sum())
+    n_anomaly_tr = int((train_df["label"] == 1).sum())
+    ratio_tr = (n_normal_tr / n_anomaly_tr) if n_anomaly_tr > 0 else float("inf")
 
-    print("MIT-BIH binary class distribution:")
-    _format_distribution("Train", y_train)
-    _format_distribution("Test", y_test)
-    y_all = np.concatenate([y_train, y_test], axis=0)
-    _format_distribution("Combined", y_all)
+    n_normal_te = int((test_df["label"] == 0).sum())
+    n_anomaly_te = int((test_df["label"] == 1).sum())
+    ratio_te = (n_normal_te / n_anomaly_te) if n_anomaly_te > 0 else float("inf")
+
+    print("MIT-BIH loaded:")
+    print(
+        f"  Train: {len(train_df)} samples | "
+        f"Normal={n_normal_tr} Anomaly={n_anomaly_tr} Ratio={ratio_tr:.1f}:1"
+    )
+    print(
+        f"  Test:  {len(test_df)} samples | "
+        f"Normal={n_normal_te} Anomaly={n_anomaly_te} Ratio={ratio_te:.1f}:1"
+    )
+
+    X_train = train_df.iloc[:, :187].values
+    y_train = train_df["label"].values.astype(np.int32)
+    X_test = test_df.iloc[:, :187].values
+    y_test = test_df["label"].values.astype(np.int32)
+
+    X_train = X_train.reshape(-1, 1, 187).astype(np.float32)
+    X_test = X_test.reshape(-1, 1, 187).astype(np.float32)
 
     return X_train, y_train, X_test, y_test
 
 
-def split_by_patient_simulated(X, y, n_users=47, seed=42):
-    """Simulate federated users by stratified chunking and per-user splitting.
-
-    Since this MIT-BIH CSV version does not include patient IDs, users are
-    simulated by distributing class-specific samples across users so each user
-    gets a roughly balanced local dataset.
-
-    Parameters
-    ----------
-    X : numpy.ndarray
-        Input beats with shape (N, 1, 187).
-    y : numpy.ndarray
-        Binary labels with shape (N,).
-    n_users : int, optional
-        Number of simulated federated users.
-    seed : int, optional
-        Random seed.
-
-    Returns
-    -------
-    list[dict]
-        List with one dictionary per user:
-        {user_id, X_train, y_train, X_val, y_val, X_test, y_test}
-    """
+def split_into_federated_users(X, y, n_users=47, seed=42):
     X = np.asarray(X, dtype=np.float32)
     y = np.asarray(y, dtype=np.int32).reshape(-1)
 
@@ -151,31 +61,40 @@ def split_by_patient_simulated(X, y, n_users=47, seed=42):
 
     rng = np.random.default_rng(seed)
 
-    idx_normal = np.where(y == 0)[0]
-    idx_anomaly = np.where(y == 1)[0]
-    rng.shuffle(idx_normal)
-    rng.shuffle(idx_anomaly)
+    normal_idx = np.where(y == 0)[0]
+    anomaly_idx = np.where(y == 1)[0]
 
-    normal_chunks = np.array_split(idx_normal, n_users)
-    anomaly_chunks = np.array_split(idx_anomaly, n_users)
+    rng.shuffle(normal_idx)
+    rng.shuffle(anomaly_idx)
 
-    user_splits = []
+    normal_chunks = np.array_split(normal_idx, n_users)
+    anomaly_chunks = np.array_split(anomaly_idx, n_users)
+
+    user_data_list = []
+    train_sizes = []
+    anomaly_rates = []
 
     for user_id in range(n_users):
         user_idx = np.concatenate([normal_chunks[user_id], anomaly_chunks[user_id]])
-        if user_idx.size == 0:
-            user_X = np.empty((0, 1, 187), dtype=np.float32)
-            user_y = np.empty((0,), dtype=np.int32)
-        else:
-            rng.shuffle(user_idx)
-            user_X = X[user_idx]
-            user_y = y[user_idx]
+        rng.shuffle(user_idx)
 
-        X_train, y_train, X_val, y_val, X_test, y_test = _stratified_split_three_way(
-            user_X, user_y, seed=seed + user_id
-        )
+        X_user = X[user_idx]
+        y_user = y[user_idx]
 
-        user_splits.append(
+        n_total = len(y_user)
+        n_tr = int(0.6 * n_total)
+        n_val = int(0.2 * n_total)
+
+        X_train = X_user[:n_tr]
+        y_train = y_user[:n_tr]
+        X_val = X_user[n_tr:n_tr + n_val]
+        y_val = y_user[n_tr:n_tr + n_val]
+        X_test = X_user[n_tr + n_val:]
+        y_test = y_user[n_tr + n_val:]
+
+        anomaly_rate = float(y_user.mean()) if len(y_user) > 0 else 0.0
+
+        user_data_list.append(
             {
                 "user_id": int(user_id),
                 "X_train": X_train,
@@ -187,5 +106,69 @@ def split_by_patient_simulated(X, y, n_users=47, seed=42):
             }
         )
 
-    print(f"Created {len(user_splits)} simulated users from MIT-BIH data")
-    return user_splits
+        train_sizes.append(len(X_train))
+        anomaly_rates.append(anomaly_rate)
+
+        print(
+            f"User {user_id:03d}: train={len(X_train)} val={len(X_val)} test={len(X_test)} "
+            f"anomaly_rate={anomaly_rate:.3f}"
+        )
+
+    avg_train = float(np.mean(train_sizes)) if train_sizes else 0.0
+    avg_rate = float(np.mean(anomaly_rates)) if anomaly_rates else 0.0
+    print(
+        f"Split complete: {n_users} users | "
+        f"avg train size={avg_train:.0f} | avg anomaly rate={avg_rate:.3f}"
+    )
+
+    return user_data_list
+
+
+def normalize_ecg_users(user_data_list):
+    normalized = []
+
+    for user_data in user_data_list:
+        out = dict(user_data)
+
+        X_train = out["X_train"].astype(np.float32)
+        X_val = out["X_val"].astype(np.float32)
+        X_test = out["X_test"].astype(np.float32)
+
+        mean = float(X_train.mean()) if X_train.size > 0 else 0.0
+        std = float(X_train.std()) if X_train.size > 0 else 1.0
+        std = std + 1e-8
+
+        out["X_train"] = ((X_train - mean) / std).astype(np.float32)
+        out["X_val"] = ((X_val - mean) / std).astype(np.float32)
+        out["X_test"] = ((X_test - mean) / std).astype(np.float32)
+        out["mean"] = mean
+        out["std"] = std
+
+        normalized.append(out)
+
+    return normalized
+
+
+# Backward-compatible alias used by existing experiment scripts.
+def split_by_patient_simulated(X, y, n_users=47, seed=42):
+    return split_into_federated_users(X, y, n_users=n_users, seed=seed)
+
+
+if __name__ == "__main__":
+    train_csv = "data/raw/ecg/mitbih_train.csv"
+    test_csv = "data/raw/ecg/mitbih_test.csv"
+
+    X_train, y_train, X_test, y_test = load_mitbih(train_csv, test_csv)
+    X_all = np.concatenate([X_train, X_test], axis=0)
+    y_all = np.concatenate([y_train, y_test], axis=0)
+
+    users = split_into_federated_users(X_all, y_all, n_users=47, seed=42)
+    users = normalize_ecg_users(users)
+
+    u0 = users[0]
+    rate0 = float(u0["y_train"].mean()) if len(u0["y_train"]) > 0 else 0.0
+    print(
+        f"User 0: X_train={u0['X_train'].shape} y_train={u0['y_train'].shape} "
+        f"anomaly_rate={rate0:.3f}"
+    )
+    print("ECG loader test passed!")

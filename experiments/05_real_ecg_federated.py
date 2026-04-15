@@ -37,7 +37,7 @@ try:
     from src.data.datasets import get_class_weights
     from src.data.ecg_loader import load_mitbih, split_by_patient_simulated
     from src.evaluation.metrics import compute_metrics
-    from src.federated.strategy import CheckpointFedAvg
+    from src.federated.strategy import FedAvgWithLogging
     from src.models.base_cnn import CNNAnomalyDetector
     from src.personalization.calibration import ScoreCalibrator
     from src.personalization.thresholds import ThresholdSelector
@@ -49,7 +49,7 @@ except ModuleNotFoundError:
     from src.data.datasets import get_class_weights
     from src.data.ecg_loader import load_mitbih, split_by_patient_simulated
     from src.evaluation.metrics import compute_metrics
-    from src.federated.strategy import CheckpointFedAvg
+    from src.federated.strategy import FedAvgWithLogging
     from src.models.base_cnn import CNNAnomalyDetector
     from src.personalization.calibration import ScoreCalibrator
     from src.personalization.thresholds import ThresholdSelector
@@ -168,7 +168,7 @@ class ECGFederatedClient(fl.client.NumPyClient):
 
         return float(val_loss), int(self.X_val.shape[0]), {
             "val_loss": float(val_loss),
-            "ROC_AUC": float(roc_auc),
+            "roc_auc": float(roc_auc),
         }
 
 
@@ -214,11 +214,21 @@ def _load_synthetic_summary():
     for path in candidates:
         if os.path.exists(path):
             df = pd.read_csv(path)
+
+            if "improved" in df.columns:
+                improved_users_pct = float(100.0 * df["improved"].mean())
+            elif "delta_TPR" in df.columns and "delta_FPR" in df.columns:
+                improved_users_pct = float(
+                    100.0 * (((df["delta_TPR"] > 0.0) & (df["delta_FPR"] <= 0.0)).mean())
+                )
+            else:
+                improved_users_pct = float("nan")
+
             return {
                 "dataset": "synthetic",
                 "mean_delta_TPR": float(df["delta_TPR"].mean()),
                 "mean_delta_FPR": float(df["delta_FPR"].mean()),
-                "improved_users_pct": float(100.0 * df["improved"].mean()),
+                "improved_users_pct": improved_users_pct,
                 "n_users": int(df.shape[0]),
                 "source": path,
             }
@@ -245,17 +255,10 @@ def run_real_ecg_federated():
     base_model = CNNAnomalyDetector(in_channels=1, window_size=WINDOW_SIZE)
     initial_parameters = _build_initial_parameters(base_model)
 
-    min_clients = max(1, int(FRACTION_FIT * N_USERS))
-    strategy = CheckpointFedAvg(
-        checkpoint_dir=CHECKPOINT_DIR,
-        in_channels=1,
-        window_size=WINDOW_SIZE,
-        fraction_fit=FRACTION_FIT,
-        fraction_evaluate=FRACTION_FIT,
-        min_fit_clients=min_clients,
-        min_evaluate_clients=min_clients,
-        min_available_clients=N_USERS,
+    strategy = FedAvgWithLogging(
         initial_parameters=initial_parameters,
+        n_rounds=N_ROUNDS,
+        checkpoint_dir=CHECKPOINT_DIR,
     )
 
     client_fn = _make_client_fn(user_splits)
@@ -282,10 +285,12 @@ def run_real_ecg_federated():
             num_clients=N_USERS,
             config=fl.server.ServerConfig(num_rounds=N_ROUNDS),
             strategy=strategy,
-            client_resources={"num_cpus": 1},
+            client_resources={"num_cpus": 1, "num_gpus": 0.0},
         )
 
-        final_round_path = os.path.join(CHECKPOINT_DIR, f"round_{N_ROUNDS}.pt")
+        strategy.print_final_summary()
+
+        final_round_path = os.path.join(CHECKPOINT_DIR, f"round_{N_ROUNDS:03d}.pt")
         if os.path.exists(final_round_path):
             selected_checkpoint = final_round_path
         else:
@@ -320,7 +325,10 @@ def run_real_ecg_federated():
             calibrator = ScoreCalibrator()
             calibrator.fit(val_scores, y_val, lr=0.01, epochs=100)
             val_cal = calibrator.predict(val_scores)
-            thr, val_fpr, val_tpr = selector.find_threshold(val_cal, y_val, target_fpr=TARGET_FPR)
+            thr_info = selector.find_threshold(val_cal, y_val, target_fpr=TARGET_FPR)
+            thr = float(thr_info["threshold"])
+            val_fpr = float(thr_info["achieved_fpr"])
+            val_tpr = float(thr_info["achieved_tpr"])
 
             global_m = compute_metrics(y_test_u, test_scores, threshold=0.5)
             test_cal = calibrator.predict(test_scores)

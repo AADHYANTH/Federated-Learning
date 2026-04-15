@@ -1,111 +1,120 @@
-"""Custom Flower strategy for federated anomaly detection training."""
-
-from __future__ import annotations
-
-import os
-from collections import OrderedDict
-
-import flwr as fl
-import mlflow
+import sys, os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import numpy as np
 import torch
-
+import mlflow
+from typing import List, Tuple, Dict, Optional, Union
+import flwr as fl
+from flwr.common import Parameters, Scalar, NDArrays
+from flwr.server.client_proxy import ClientProxy
+from flwr.common import FitRes, EvaluateRes
 from src.models.base_cnn import CNNAnomalyDetector
 
 
-class CheckpointFedAvg(fl.server.strategy.FedAvg):
-	"""FedAvg strategy with per-round checkpointing and MLflow metric logging.
-
-	Parameters
-	----------
-	checkpoint_dir : str
-		Directory used to store global model checkpoints per round.
-	in_channels : int, optional
-		Input channel count for model reconstruction when saving checkpoints.
-	window_size : int, optional
-		Window size used to instantiate the global model architecture.
-	**kwargs
-		Additional keyword arguments forwarded to ``fl.server.strategy.FedAvg``.
-	"""
-
-	def __init__(self, checkpoint_dir, in_channels=1, window_size=128, **kwargs):
-		super().__init__(**kwargs)
+class FedAvgWithLogging(fl.server.strategy.FedAvg):
+	def __init__(self, initial_parameters, n_rounds, checkpoint_dir):
+		super().__init__(
+			fraction_fit=0.4,
+			fraction_evaluate=0.4,
+			min_fit_clients=5,
+			min_evaluate_clients=5,
+			min_available_clients=10,
+			initial_parameters=initial_parameters,
+		)
+		self.n_rounds = n_rounds
 		self.checkpoint_dir = checkpoint_dir
-		self.in_channels = int(in_channels)
-		self.window_size = int(window_size)
-		os.makedirs(self.checkpoint_dir, exist_ok=True)
+		os.makedirs(checkpoint_dir, exist_ok=True)
+		self.round_train_losses = []
+		self.round_val_losses = []
+		self.round_roc_aucs = []
+		self.best_roc_auc = 0.0
+		self.best_round = 0
 
-	def _save_parameters_checkpoint(self, parameters, server_round):
-		"""Save aggregated global parameters as a PyTorch state_dict checkpoint."""
-		ndarrays = fl.common.parameters_to_ndarrays(parameters)
-		model = CNNAnomalyDetector(
-			in_channels=self.in_channels,
-			window_size=self.window_size,
-		)
-		state_keys = list(model.state_dict().keys())
-		state_dict = OrderedDict()
+	def aggregate_fit(
+		self,
+		server_round: int,
+		results: List[Tuple[ClientProxy, FitRes]],
+		failures: List[Union[Tuple[ClientProxy, FitRes], BaseException]],
+	) -> Tuple[Optional[Parameters], Dict[str, Scalar]]:
+		print(f"\n{'='*50}")
+		print(f"ROUND {server_round}/{self.n_rounds}")
+		print(f"{'='*50}")
+		print(f"Clients responded: {len(results)} | Failed: {len(failures)}")
 
-		for key, array in zip(state_keys, ndarrays):
-			state_dict[key] = torch.tensor(array)
-
-		model.load_state_dict(state_dict, strict=True)
-		path = os.path.join(self.checkpoint_dir, f"round_{server_round}.pt")
-		torch.save(model.state_dict(), path)
-
-	def aggregate_fit(self, server_round, results, failures):
-		"""Aggregate client fit results and save global model checkpoint.
-
-		This method logs the round participation count, delegates aggregation to
-		FedAvg, then saves the aggregated global model to:
-		``data/processed/checkpoints/round_{round_num}.pt``.
-		"""
-		print(
-			f"Round {server_round}: aggregating fit from "
-			f"{len(results)} participating clients"
-		)
-
-		aggregated_parameters, aggregated_metrics = super().aggregate_fit(
-			server_round, results, failures
-		)
-
-		if aggregated_parameters is not None:
-			self._save_parameters_checkpoint(aggregated_parameters, server_round)
-
-		return aggregated_parameters, aggregated_metrics
-
-	def aggregate_evaluate(self, server_round, results, failures):
-		"""Aggregate evaluation metrics with weighted means and log to MLflow.
-
-		Computes weighted averages (by number of client validation examples) for
-		validation loss and ROC_AUC, prints round summary, and logs both metrics.
-		"""
-		del failures
 		if not results:
 			return None, {}
 
-		total_examples = 0
-		weighted_val_loss = 0.0
-		weighted_roc_auc = 0.0
+		total_examples = sum(fit_res.num_examples for _, fit_res in results)
+		weighted_loss = sum(
+			fit_res.metrics["train_loss"] * fit_res.num_examples
+			for _, fit_res in results
+		) / total_examples
 
-		for _, eval_res in results:
-			n = int(eval_res.num_examples)
-			total_examples += n
-			weighted_val_loss += float(eval_res.loss) * n
-			weighted_roc_auc += float(eval_res.metrics.get("ROC_AUC", 0.0)) * n
+		print(f"Avg train_loss: {weighted_loss:.4f}")
+		self.round_train_losses.append(weighted_loss)
 
-		if total_examples == 0:
-			avg_val_loss = 0.0
-			avg_roc_auc = 0.0
-		else:
-			avg_val_loss = weighted_val_loss / total_examples
-			avg_roc_auc = weighted_roc_auc / total_examples
+		aggregated = super().aggregate_fit(server_round, results, failures)
 
-		print(
-			f"Round {server_round} - val_loss: {avg_val_loss:.4f} | "
-			f"mean_ROC_AUC: {avg_roc_auc:.4f}"
-		)
+		if aggregated[0] is not None:
+			weights = fl.common.parameters_to_ndarrays(aggregated[0])
+			model = CNNAnomalyDetector(in_channels=1, window_size=128)
+			params_dict = zip(model.state_dict().keys(), weights)
+			state_dict = {k: torch.tensor(v) for k, v in params_dict}
+			model.load_state_dict(state_dict, strict=True)
+			save_path = os.path.join(self.checkpoint_dir, f"round_{server_round:03d}.pt")
+			torch.save(model.state_dict(), save_path)
+			print(f"Checkpoint saved: round_{server_round:03d}.pt")
 
-		if mlflow.active_run() is not None:
-			mlflow.log_metric("val_loss", float(avg_val_loss), step=server_round)
-			mlflow.log_metric("mean_ROC_AUC", float(avg_roc_auc), step=server_round)
+		return aggregated
 
-		return float(avg_val_loss), {"mean_ROC_AUC": float(avg_roc_auc)}
+	def aggregate_evaluate(
+		self,
+		server_round: int,
+		results: List[Tuple[ClientProxy, EvaluateRes]],
+		failures: List[Union[Tuple[ClientProxy, EvaluateRes], BaseException]],
+	) -> Tuple[Optional[float], Dict[str, Scalar]]:
+		if not results:
+			return None, {}
+
+		total_examples = sum(eval_res.num_examples for _, eval_res in results)
+		weighted_val_loss = sum(
+			eval_res.metrics["val_loss"] * eval_res.num_examples
+			for _, eval_res in results
+		) / total_examples
+		weighted_roc_auc = sum(
+			eval_res.metrics["roc_auc"] * eval_res.num_examples
+			for _, eval_res in results
+		) / total_examples
+
+		self.round_val_losses.append(weighted_val_loss)
+		self.round_roc_aucs.append(weighted_roc_auc)
+
+		print(f"Avg val_loss: {weighted_val_loss:.4f} | Avg ROC_AUC: {weighted_roc_auc:.4f}")
+
+		if weighted_roc_auc > self.best_roc_auc:
+			self.best_roc_auc = weighted_roc_auc
+			self.best_round = server_round
+			print(f"*** New best ROC_AUC: {weighted_roc_auc:.4f} ***")
+
+		try:
+			mlflow.log_metric("fed_train_loss", self.round_train_losses[-1], step=server_round)
+			mlflow.log_metric("fed_val_loss", weighted_val_loss, step=server_round)
+			mlflow.log_metric("fed_roc_auc", weighted_roc_auc, step=server_round)
+		except Exception:
+			pass
+
+		return super().aggregate_evaluate(server_round, results, failures)
+
+	def get_best_round(self) -> int:
+		return self.best_round
+
+	def print_final_summary(self):
+		print(f"{'='*50}")
+		print("FEDERATED TRAINING COMPLETE")
+		print(f"{'='*50}")
+		print(f"Total rounds: {self.n_rounds}")
+		print(f"Best ROC_AUC: {self.best_roc_auc:.4f} at round {self.best_round}")
+		print(f"Best val_loss: {min(self.round_val_losses):.4f}")
+		print(f"Final ROC_AUC: {self.round_roc_aucs[-1]:.4f}")
+		print(f"Final val_loss: {self.round_val_losses[-1]:.4f}")
+		print(f"{'='*50}")

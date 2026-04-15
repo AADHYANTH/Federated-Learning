@@ -1,220 +1,225 @@
-"""Edge deployment demo: ONNX export, latency benchmark, and streaming inference."""
-
-from __future__ import annotations
-
-import glob
-import os
-import sys
-import time
-
+import sys, os
+sys.path.insert(0, os.path.dirname(os.path.dirname(
+    os.path.abspath(__file__))))
 import numpy as np
-import onnxruntime as ort
-import pandas as pd
 import torch
+import time
+import pandas as pd
+import onnx
+import onnxruntime as ort
+from src.models.base_cnn import CNNAnomalyDetector
+from src.personalization.calibration import ScoreCalibrator
 
 
-MODEL_PATH = "data/processed/global_model_federated.pt"
-ONNX_PATH = "data/processed/model_edge.onnx"
-PERSONALIZATION_PATH = "data/processed/personalization_results.csv"
-USER_ID = 0
-DATA_DIR = "data/raw/synthetic"
-WINDOW_SIZE = 128
-STRIDE = 64
-N_BENCHMARK_RUNS = 1000
+SYNTH_MODEL_PATH = 'data/processed/global_model_federated.pt'
+ECG_MODEL_PATH = 'data/processed/ecg_model_federated.pt'
+SYNTH_ONNX_PATH = 'data/processed/model_synth_edge.onnx'
+ECG_ONNX_PATH = 'data/processed/model_ecg_edge.onnx'
+PERS_RESULTS = 'data/processed/personalization_results.csv'
+DATA_DIR = 'data/raw/synthetic'
+WINDOW_SIZE_SYNTH = 128
+WINDOW_SIZE_ECG = 187
+N_LATENCY_RUNS = 1000
+DEMO_USER_ID = 7
 
 
-try:
-	from src.data.preprocessing import load_user_data
-	from src.models.base_cnn import CNNAnomalyDetector
-except ModuleNotFoundError:
-	current_dir = os.path.dirname(os.path.abspath(__file__))
-	project_root = os.path.abspath(os.path.join(current_dir, ".."))
-	if project_root not in sys.path:
-		sys.path.insert(0, project_root)
-	from src.data.preprocessing import load_user_data
-	from src.models.base_cnn import CNNAnomalyDetector
+def export_to_onnx(model_path, onnx_path, window_size, label):
+    print(f"\n[ONNX Export — {label}]")
+
+    model = CNNAnomalyDetector(in_channels=1, window_size=window_size)
+    model.load_state_dict(
+        torch.load(model_path, map_location='cpu'))
+    model.eval()
+
+    dummy_input = torch.randn(1, 1, window_size)
+
+    torch.onnx.export(
+        model, dummy_input, onnx_path,
+        export_params=True,
+        opset_version=12,
+        do_constant_folding=True,
+        input_names=['signal_window'],
+        output_names=['anomaly_score'],
+        dynamic_axes={
+            'signal_window': {0: 'batch_size'},
+            'anomaly_score': {0: 'batch_size'}
+        }
+    )
+
+    model_onnx = onnx.load(onnx_path)
+    onnx.checker.check_model(model_onnx)
+
+    size_mb = os.path.getsize(onnx_path) / (1024 * 1024)
+
+    print(f"  Exported to {onnx_path}")
+    print(f"  File size: {size_mb:.2f} MB")
+    print("  ONNX validation: PASSED")
+    return onnx_path
 
 
-def _sigmoid(x):
-	"""Numerically stable sigmoid for scalar/array inputs."""
-	x = np.clip(x, -50.0, 50.0)
-	return 1.0 / (1.0 + np.exp(-x))
+def benchmark_latency(onnx_path, window_size, label, n_runs=1000):
+    print(f"\n[Latency Benchmark — {label}]")
+
+    session = ort.InferenceSession(onnx_path,
+        providers=['CPUExecutionProvider'])
+    input_name = session.get_inputs()[0].name
+
+    for _ in range(50):
+        dummy = np.random.randn(1, 1, window_size).astype(np.float32)
+        session.run(None, {input_name: dummy})
+
+    latencies = []
+    for _ in range(n_runs):
+        dummy = np.random.randn(1, 1, window_size).astype(np.float32)
+        start = time.perf_counter()
+        session.run(None, {input_name: dummy})
+        end = time.perf_counter()
+        latencies.append((end - start) * 1000)
+
+    mean_ms = np.mean(latencies)
+    std_ms = np.std(latencies)
+    min_ms = np.min(latencies)
+    max_ms = np.max(latencies)
+    p50_ms = np.percentile(latencies, 50)
+    p95_ms = np.percentile(latencies, 95)
+    p99_ms = np.percentile(latencies, 99)
+
+    print(f"  Runs:      {n_runs}")
+    print(f"  Mean:      {mean_ms:.3f} ms")
+    print(f"  Std:       {std_ms:.3f} ms")
+    print(f"  Min:       {min_ms:.3f} ms")
+    print(f"  Max:       {max_ms:.3f} ms")
+    print(f"  P50:       {p50_ms:.3f} ms")
+    print(f"  P95:       {p95_ms:.3f} ms")
+    print(f"  P99:       {p99_ms:.3f} ms")
+
+    if mean_ms < 50:
+        print(f"  ✅ PASSED: Mean latency {mean_ms:.2f}ms < 50ms target")
+    else:
+        print(f"  ⚠️  Mean latency {mean_ms:.2f}ms > 50ms target")
+
+    return {'mean': mean_ms, 'p95': p95_ms, 'p99': p99_ms}
 
 
-def _resolve_model_path(preferred_path):
-	"""Resolve global model path with fallback to available federated models/checkpoints."""
-	if os.path.exists(preferred_path):
-		return preferred_path
+def run_streaming_demo(onnx_path, demo_user_id):
+    print(f"\n[Streaming Edge Demo — User {demo_user_id:03d}]")
+    print("Simulating real-time anomaly detection on device...")
+    print("-" * 50)
 
-	candidates = []
-	candidates.extend(glob.glob("data/processed/global_model_federated*.pt"))
-	candidates.extend(glob.glob("data/processed/checkpoints/round_*.pt"))
-	candidates.extend(glob.glob("data/processed/checkpoints_smoke*/round_*.pt"))
+    pers_df = pd.read_csv(PERS_RESULTS)
+    user_row = pers_df[pers_df['user_id'] == demo_user_id].iloc[0]
+    a = float(user_row['cal_a'])
+    b = float(user_row['cal_b'])
+    tau = float(user_row['cal_tau'])
 
-	if not candidates:
-		raise FileNotFoundError(
-			f"Model not found at {preferred_path} and no fallback model/checkpoints exist"
-		)
+    print(f"  Personalization: a={a:.4f} b={b:.4f} threshold={tau:.4f}")
 
-	def _sort_key(path):
-		base = os.path.basename(path)
-		if base.startswith("round_"):
-			return int(os.path.splitext(base)[0].split("_")[-1])
-		return -1
+    signal = np.load(
+      f'{DATA_DIR}/user_{demo_user_id:03d}_signal.npy')
+    labels = np.load(
+      f'{DATA_DIR}/user_{demo_user_id:03d}_labels.npy')
 
-	selected = sorted(candidates, key=_sort_key)[-1]
-	print(f"Model path {preferred_path} not found. Using fallback: {selected}")
-	return selected
+    if signal.ndim == 1:
+      signal = signal.reshape(-1, 1)
+    labels = labels.reshape(-1)
 
+    train_portion = signal[:3000]
+    mean = train_portion.mean()
+    std = train_portion.std() + 1e-8
+    signal = (signal - mean) / std
 
-def _load_personalization_params(csv_path, user_id):
-	"""Load per-user personalization parameters (a, b, tau) from results CSV."""
-	path = csv_path
-	if not os.path.exists(path):
-		fallbacks = [
-			"data/processed/personalization_results.csv",
-			"data/processed/personalization_results_smoke.csv",
-		]
-		found = next((p for p in fallbacks if os.path.exists(p)), None)
-		if found is None:
-			raise FileNotFoundError(
-				f"Personalization results not found at {csv_path} and no fallback CSV exists"
-			)
-		path = found
-		print(f"Personalization file {csv_path} not found. Using fallback: {path}")
+    session = ort.InferenceSession(onnx_path,
+      providers=['CPUExecutionProvider'])
+    input_name = session.get_inputs()[0].name
 
-	df = pd.read_csv(path)
-	row = df.loc[df["user_id"] == int(user_id)]
-	if row.empty:
-		raise ValueError(f"No row found for user_id={user_id} in {path}")
-	row = row.iloc[0]
+    stride = WINDOW_SIZE_SYNTH // 2
+    window_count = 0
+    true_positives = 0
+    false_positives = 0
+    true_negatives = 0
+    false_negatives = 0
+    alerts_fired = []
 
-	# Accept multiple column naming conventions.
-	a = float(row.get("a_i", row.get("a", row.get("calib_a", 1.0))))
-	b = float(row.get("b_i", row.get("b", row.get("calib_b", 0.0))))
-	tau = float(row.get("tau_i", row.get("tau", row.get("threshold", 0.5))))
+    for start in range(0, len(signal) - WINDOW_SIZE_SYNTH, stride):
+      window = signal[start:start + WINDOW_SIZE_SYNTH]
+      window_labels = labels[start:start + WINDOW_SIZE_SYNTH]
+      true_label = 1 if window_labels.mean() > 0.3 else 0
 
-	if "a_i" not in row.index and "a" not in row.index and "calib_a" not in row.index:
-		print("Calibration scale a not found in CSV. Using default a=1.0")
-	if "b_i" not in row.index and "b" not in row.index and "calib_b" not in row.index:
-		print("Calibration bias b not found in CSV. Using default b=0.0")
-	if "tau_i" not in row.index and "tau" not in row.index and "threshold" not in row.index:
-		print("Threshold tau not found in CSV. Using default tau=0.5")
+      window_t = window.T
+      onnx_input = window_t.reshape(1, 1, WINDOW_SIZE_SYNTH).astype(np.float32)
+      output = session.run(None, {input_name: onnx_input})
+      base_score = float(np.asarray(output[0]).reshape(-1)[0])
 
-	return a, b, tau
+      cal_score = 1 / (1 + np.exp(-(a * base_score + b)))
 
+      alert = cal_score >= tau
 
-def export_onnx(model_path=MODEL_PATH, onnx_path=ONNX_PATH):
-	"""Export PyTorch CNN model to ONNX and verify with ONNX Runtime."""
-	os.makedirs(os.path.dirname(onnx_path), exist_ok=True)
-	resolved_path = _resolve_model_path(model_path)
+      if alert and true_label == 1:
+        true_positives += 1
+      elif alert and true_label == 0:
+        false_positives += 1
+      elif (not alert) and true_label == 0:
+        true_negatives += 1
+      else:
+        false_negatives += 1
 
-	model = CNNAnomalyDetector(in_channels=1, window_size=WINDOW_SIZE)
-	state_dict = torch.load(resolved_path, map_location="cpu")
-	model.load_state_dict(state_dict)
-	model.eval()
+      alerts_fired.append(bool(alert))
 
-	dummy_input = torch.randn(1, 1, 128, dtype=torch.float32)
-	torch.onnx.export(
-		model,
-		dummy_input,
-		onnx_path,
-		export_params=True,
-		opset_version=12,
-		do_constant_folding=True,
-		input_names=["input"],
-		output_names=["output"],
-	)
+      if window_count % 10 == 0:
+        status = "🚨 ANOMALY" if alert else "✅ Normal "
+        correct = "✓" if (alert == bool(true_label)) else "✗"
+        print(f"  Window {window_count:04d} | "
+          f"base={base_score:.3f} cal={cal_score:.3f} | "
+          f"{status} | truth={'ANOM' if true_label else 'norm'} {correct}")
 
-	# Verify model loads and runs in ONNX Runtime.
-	session = ort.InferenceSession(onnx_path, providers=["CPUExecutionProvider"])
-	_ = session.run(None, {session.get_inputs()[0].name: dummy_input.numpy()})
+      window_count += 1
 
-	print(f"ONNX export successful. Model saved to {onnx_path}")
-	return session
-
-
-def benchmark_latency(session, n_runs=N_BENCHMARK_RUNS):
-	"""Run repeated ONNX inference and print latency statistics."""
-	input_name = session.get_inputs()[0].name
-
-	latencies_ms = []
-	for _ in range(int(n_runs)):
-		x = np.random.randn(1, 1, 128).astype(np.float32)
-		t0 = time.perf_counter()
-		_ = session.run(None, {input_name: x})
-		t1 = time.perf_counter()
-		latencies_ms.append((t1 - t0) * 1000.0)
-
-	arr = np.array(latencies_ms, dtype=np.float64)
-	mean_ms = float(arr.mean())
-	std_ms = float(arr.std())
-	min_ms = float(arr.min())
-	max_ms = float(arr.max())
-	p95_ms = float(np.percentile(arr, 95))
-
-	print("Latency benchmark (ms) over 1000 runs:")
-	print(f"mean: {mean_ms:.4f}")
-	print(f"std:  {std_ms:.4f}")
-	print(f"min:  {min_ms:.4f}")
-	print(f"max:  {max_ms:.4f}")
-	print(f"p95:  {p95_ms:.4f}")
-	print(f"Mean latency under 50ms: {mean_ms < 50.0}")
-
-
-def run_streaming_demo(session, user_id=USER_ID):
-	"""Simulate streaming inference with per-user personalization on test windows."""
-	user_data = load_user_data(
-		user_id=user_id,
-		data_dir=DATA_DIR,
-		window_size=WINDOW_SIZE,
-		stride=STRIDE,
-	)
-	X_test = user_data["X_test"]  # (N, W, C)
-	y_test = user_data["y_test"].astype(np.int32)
-
-	a, b, tau = _load_personalization_params(PERSONALIZATION_PATH, user_id=user_id)
-	print(f"Using personalization params for user {user_id}: a={a:.4f}, b={b:.4f}, tau={tau:.4f}")
-
-	input_name = session.get_inputs()[0].name
-
-	y_pred = []
-	for i in range(X_test.shape[0]):
-		window = X_test[i].T[np.newaxis, :, :].astype(np.float32)  # (1, 1, 128)
-		base_score = float(session.run(None, {input_name: window})[0].reshape(-1)[0])
-		p = float(_sigmoid(a * base_score + b))
-
-		if p > tau:
-			print(f"ANOMALY DETECTED at window {i}")
-			y_pred.append(1)
-		else:
-			print(f"Normal at window {i}")
-			y_pred.append(0)
-
-	y_pred = np.asarray(y_pred, dtype=np.int32)
-
-	tp = int(((y_pred == 1) & (y_test == 1)).sum())
-	tn = int(((y_pred == 0) & (y_test == 0)).sum())
-	fp = int(((y_pred == 1) & (y_test == 0)).sum())
-	fn = int(((y_pred == 0) & (y_test == 1)).sum())
-
-	tpr = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-	fpr = fp / (fp + tn) if (fp + tn) > 0 else 0.0
-
-	print("\nStreaming summary")
-	print(f"total windows: {X_test.shape[0]}")
-	print(f"anomalies detected: {int((y_pred == 1).sum())}")
-	print(f"true anomalies in ground truth: {int((y_test == 1).sum())}")
-	print(f"TPR achieved: {tpr:.4f}")
-	print(f"FPR achieved: {fpr:.4f}")
+    print("\n--- Demo Summary ---")
+    print(f"Windows processed: {window_count}")
+    alert_total = sum(alerts_fired)
+    alert_pct = (alert_total / window_count * 100) if window_count > 0 else 0.0
+    print(f"Alerts fired:      {alert_total} "
+      f"({alert_pct:.1f}%)")
+    print(f"True Positives:    {true_positives}")
+    print(f"False Positives:   {false_positives}")
+    print(f"True Negatives:    {true_negatives}")
+    print(f"False Negatives:   {false_negatives}")
+    tpr = true_positives / (true_positives + false_negatives) \
+      if (true_positives + false_negatives) > 0 else 0
+    fpr = false_positives / (false_positives + true_negatives) \
+      if (false_positives + true_negatives) > 0 else 0
+    print(f"Demo TPR: {tpr:.4f}")
+    print(f"Demo FPR: {fpr:.4f}")
 
 
 def main():
-	"""Run all edge demo parts end-to-end."""
-	session = export_onnx()
-	benchmark_latency(session)
-	run_streaming_demo(session, user_id=USER_ID)
+  print(f"\n{'#' * 60}")
+  print("WEEK 4 — EDGE DEMO & ONNX EXPORT")
+  print(f"{'#' * 60}")
+
+  export_to_onnx(SYNTH_MODEL_PATH, SYNTH_ONNX_PATH,
+    WINDOW_SIZE_SYNTH, "Synthetic Model")
+  if os.path.exists(ECG_MODEL_PATH):
+    export_to_onnx(ECG_MODEL_PATH, ECG_ONNX_PATH,
+      WINDOW_SIZE_ECG, "ECG Model")
+  else:
+    print("ECG model not found — skipping ECG export")
+
+  synth_latency = benchmark_latency(
+    SYNTH_ONNX_PATH, WINDOW_SIZE_SYNTH, "Synthetic", n_runs=N_LATENCY_RUNS)
+  _ = synth_latency
+  if os.path.exists(ECG_ONNX_PATH):
+    ecg_latency = benchmark_latency(
+      ECG_ONNX_PATH, WINDOW_SIZE_ECG, "ECG", n_runs=N_LATENCY_RUNS)
+    _ = ecg_latency
+
+  run_streaming_demo(SYNTH_ONNX_PATH, DEMO_USER_ID)
+
+  print("\n✅ Edge demo complete!")
+  print(f"ONNX models: {SYNTH_ONNX_PATH}")
+  print("Next: Run experiments/06_final_report.py "
+    "then write README")
 
 
-if __name__ == "__main__":
-	main()
+if __name__ == '__main__':
+  main()

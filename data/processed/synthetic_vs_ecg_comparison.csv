@@ -1,0 +1,2 @@
+synthetic_centralized_roc_auc,real_ecg_centralized_roc_auc,synthetic_federated_roc_auc,real_ecg_federated_roc_auc,synthetic_personalized_tpr,real_ecg_personalized_tpr,synthetic_personalized_fpr,real_ecg_personalized_fpr,synthetic_users_tpr_improved,real_ecg_users_tpr_improved
+0.999,0.9887091252945798,0.9993,0.9908371626706053,0.8516363636363637,0.9336576985593998,0.0,0.01387523298137353,8/50,4/47
