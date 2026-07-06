@@ -3,7 +3,6 @@ Badges: Python 3.10 | PyTorch | Flower | ONNX | MLflow
 
 ## 1. Title and Badges
 
-The title and badges are shown at the top of this README as requested.
 
 ## 2. Project Description
 
